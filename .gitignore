@@ -6,3 +6,6 @@
 /**/work
 /**/logs
 /**/.idea
+.DS_Store
+*.log
+housesell.sql

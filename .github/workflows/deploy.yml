@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      back: ${{ steps.filter.outputs.back }}
+      front: ${{ steps.filter.outputs.front }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            back:
+              - 'back/**'
+              - '.github/workflows/deploy.yml'
+            front:
+              - 'front/**'
+              - '.github/workflows/deploy.yml'
+
+  backend:
+    needs: changes
+    if: needs.changes.outputs.back == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build jar
+        working-directory: back
+        run: mvn -B -DskipTests package
+
+      - name: Upload jar to server
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: back/target/house-sell-1.0.0.jar
+          target: /opt/housesell/back/target/
+          strip_components: 3
+          overwrite: true
+
+      - name: Restart backend
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            systemctl restart housesell
+            for i in $(seq 1 30); do
+              if curl -fsS -o /dev/null http://127.0.0.1:8090/zwz/common/captcha/draw/ci; then
+                echo "backend healthy"; exit 0
+              fi
+              sleep 2
+            done
+            echo "backend health check failed"
+            tail -50 /var/log/housesell.log
+            exit 1
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.front == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+
+      - name: Install deps
+        working-directory: front
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        working-directory: front
+        run: npm run build
+
+      - name: Upload dist to server
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: front/dist/
+          target: /opt/housesell/front/dist/
+          strip_components: 2
+          rm: true
+          overwrite: true
+
+      - name: Verify nginx
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            test -f /opt/housesell/front/dist/index.html || { echo "index.html missing"; exit 1; }
+            curl -fsS -o /dev/null http://127.0.0.1:8081/ && echo "frontend OK"
